@@ -5,45 +5,87 @@ from Bio.PDB import PDBParser, NeighborSearch, Selection
 import numpy as np
 import sys
 
+PROJECT_ROOT = r"C:\Users\aszyk\PycharmProjects\Miniproject 4 scaffold engineering"
+SCRIPTS_ROOT = os.path.join(PROJECT_ROOT, "Miniproject4 scripts")
 
+INPUT_DIR  = os.path.join(SCRIPTS_ROOT, "Input files")
+OUTPUT_DIR = os.path.join(SCRIPTS_ROOT, "Output")
 
-# 0. Prep pdf file (can be skipped)
+CLEANED_PDB_DIR = os.path.join(INPUT_DIR, "cleaned_pdb")  # <-- always under Input files
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CLEANED_PDB_DIR, exist_ok=True)
+
+# 0. Prep pdf file (I would recommend running this)
+
 def clean_and_renumber_pdb(input_pdb, output_all_chains, output_single_chain, target_chain=None):
     parser = PDB.PDBParser(QUIET=True)
     structure = parser.get_structure("protein", input_pdb)
-
     io = PDB.PDBIO()
+
+    # Normalize chain input
+    target_chain = (target_chain or "").strip()
+    if target_chain == "":
+        target_chain = None  # means "don't write single-chain file"
+
+    # Collect chain IDs present (first model)
+    model0 = structure[0]
+    chain_ids = [ch.id for ch in model0.get_chains()]
+    print("Chains found in PDB:", chain_ids)
+
+    if target_chain is not None and target_chain not in chain_ids:
+        raise ValueError(f"Chain '{target_chain}' not found in PDB. Available: {chain_ids}")
 
     class SelectAllChains(PDB.Select):
         def accept_residue(self, residue):
-            return residue.id[0] == " "  # Exclude heteroatoms and waters
+            return residue.id[0] == " "  # standard residues only
         def accept_atom(self, atom):
-            return atom.element != "H"  # Remove hydrogens
+            return atom.element != "H"   # drop hydrogens
 
     class SelectSingleChain(PDB.Select):
         def accept_chain(self, chain):
-            return chain.id == target_chain
+            return (target_chain is None) or (chain.id == target_chain)
         def accept_residue(self, residue):
             return residue.id[0] == " "
         def accept_atom(self, atom):
             return atom.element != "H"
 
-    # Renumber all residues starting from 1 per chain
+    # Renumber standard residues starting from 1 per chain
     for model in structure:
         for chain in model:
-            for i, residue in enumerate(chain.get_residues(), start=1):
+            i = 1
+            for residue in chain:
+                if residue.id[0] != " ":
+                    continue
                 residue.id = (" ", i, " ")
+                i += 1
 
     # Save all chains
+    os.makedirs(os.path.dirname(output_all_chains) or ".", exist_ok=True)
     io.set_structure(structure)
     io.save(output_all_chains, select=SelectAllChains())
-    print("Replace input_pdb with output_all_chains_path")
-    print(f"✅ Saved cleaned PDB with all chains to: {output_all_chains}")
+    print(f"✅ Saved cleaned+renumbered ALL chains to: {output_all_chains}")
 
-    # Save only the specified chain
-    io.set_structure(structure)
-    io.save(output_single_chain, select=SelectSingleChain())
-    print(f"✅ Saved cleaned PDB with chain {target_chain} to: {output_single_chain}")
+    # Save only specified chain (only if user provided one)
+    if target_chain is not None:
+        os.makedirs(os.path.dirname(output_single_chain) or ".", exist_ok=True)
+        io.set_structure(structure)
+        io.save(output_single_chain, select=SelectSingleChain())
+
+        # quick non-empty check
+        with open(output_single_chain, "r") as fh:
+            has_atom = any(line.startswith("ATOM") for line in fh)
+
+        if not has_atom:
+            raise RuntimeError(
+                f"Single-chain output is empty. Chain '{target_chain}' matched, but no ATOM lines were written.\n"
+                "This usually means the file contains only non-standard residues or selection filtered everything."
+            )
+
+        print(f"✅ Saved cleaned+renumbered chain {target_chain} to: {output_single_chain}")
+    else:
+        print("ℹ️ No chain provided -> skipped writing single-chain file.")
+
 
 # 1. CamSol B-Factors
 
@@ -114,7 +156,7 @@ def get_aggregation_residues(input_file, score_threshold=0.6):
 
 
 
-# 3. merge CamSol and AggregaScan results
+# 3. Merge CamSol and AggregaScan results
 def merge_camsol_aggregascan(camsol_hits, aggs_hits):
     merged = {}
 
@@ -209,8 +251,64 @@ def write_per_residue_mutfiles(
 
 
 
-#from Bio import PDB
-import sys
+def Aggrega4scan_auto_prep(
+    input_pdb: str,
+    output_folder: str,
+    light_range: tuple[int, int],
+    heavy_range: tuple[int, int],
+):
+    os.makedirs(output_folder, exist_ok=True)
+    output_pdb = os.path.join(output_folder, "Aggrega4auto_submission.pdb")
+
+    if not os.path.isfile(input_pdb):
+        raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
+
+    (l_start, l_end) = light_range
+    (h_start, h_end) = heavy_range
+
+    if l_start > l_end or h_start > h_end:
+        raise ValueError("Ranges must be START-END with START <= END.")
+    if not (l_end < h_start or h_end < l_start):
+        raise ValueError(f"Light range {light_range} overlaps heavy range {heavy_range}.")
+
+    parser = PDB.PDBParser(QUIET=True)
+    structure = parser.get_structure("protein", input_pdb)
+
+    new_structure = PDB.Structure.Structure("split")
+    new_model = PDB.Model.Model(0)
+    new_structure.add(new_model)
+
+    chainA = PDB.Chain.Chain("A")  # heavy
+    chainB = PDB.Chain.Chain("B")  # light
+    new_model.add(chainA)
+    new_model.add(chainB)
+
+    nA = nB = 0
+
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.id[0] != " ":
+                    continue
+                resnum = int(residue.id[1])
+
+                if h_start <= resnum <= h_end:
+                    chainA.add(residue.copy()); nA += 1
+                elif l_start <= resnum <= l_end:
+                    chainB.add(residue.copy()); nB += 1
+
+    if nA == 0 and nB == 0:
+        raise RuntimeError("No residues selected. Your ranges do not match the PDB numbering.")
+
+    io = PDB.PDBIO()
+    io.set_structure(new_structure)
+    io.save(output_pdb)
+
+    print(f"✅ Saved AggregaScan submission PDB: {output_pdb}")
+    print(f"   Heavy (A) residues written: {nA}")
+    print(f"   Light (B) residues written: {nB}")
+
+
 
 def get_instability_residues(pdb_path: str, chain_id: str):
     instability_map = {
@@ -266,27 +364,37 @@ if __name__ == "__main__":
     agg = []
     # pdb_file = input("🔍 PDB file path: ").strip()
     # fix
-    #input_pdb = r"C:\Users\aszyk\PycharmProjects\Simple_helicase_mutant_selector\pdb\2P6R.pdb"
-    pdb_file_camsol = r"C:\Users\aszyk\PycharmProjects\Miniproject 4 scaffold engineering\Miniproject4 scripts\Input files\scFv4_only_PDB_cleaner_CamSol.pdb"
-    agg_file = r'C:\Users\aszyk\PycharmProjects\Miniproject 4 scaffold engineering\Miniproject4 scripts\Input files\A4D_scores.csv'
+    input_pdb = os.path.join(INPUT_DIR, "6Y6C_BC_complex_cleaner.pdb")
+    pdb_file_camsol = os.path.join(INPUT_DIR, "scFv4_only_PDB_cleaner_CamSol.pdb")
+    agg_file = os.path.join(INPUT_DIR, "A4D_scores.csv")
 
     #results_dir = input("📂 Results folder path: ").strip()
-    results_dir=r"C:\Users\aszyk\PycharmProjects\Miniproject 4 scaffold engineering\Miniproject4 scripts\Output"
+    results_dir=OUTPUT_DIR
     os.makedirs(results_dir, exist_ok=True)
-    #output_all_chains_path = r"C:\Users\aszyk\PycharmProjects\Simple_helicase_mutant_selector\pdb\cleaned\cleaned_all.pdb"
-    #output_single_chain_path = r"C:\Users\aszyk\PycharmProjects\Simple_helicase_mutant_selector\pdb\cleaned\single_chain.pdb"
+    output_all_chains_path = os.path.join(CLEANED_PDB_DIR, "scFv4_allchains_renum.pdb")
+    # single-chain output depends on chain, but file name should differ:
+    # we'll create it after user picks a chain
 
 
-    # 0. Prep pdf file
+    # 0. Prep PDB file
     if input("✏️ Would you like to clean the pdb files and generate single chain pdb? (y/n): ").strip().lower() == 'y':
-        chain_to_keep = input("Which chain would you like to analyse later in Rosetta?")  # Set to your desired chain
-        clean_and_renumber_pdb(input_pdb, output_all_chains_path, output_single_chain_path, chain_to_keep)
+        chain_to_keep = input("Which chain would you like to analyse later in Rosetta? (e.g. C): ").strip().upper()
+        output_single_chain_path = os.path.join(CLEANED_PDB_DIR, f"scFv4_chain{chain_to_keep}_renum.pdb")
 
+        clean_and_renumber_pdb(
+            input_pdb=input_pdb,
+            output_all_chains=output_all_chains_path,
+            output_single_chain=output_single_chain_path,
+            target_chain=chain_to_keep
+        )
+    else:
+        # if you skip cleaning, define what single-chain file you want to use
+        output_single_chain_path = input_pdb
 
     # 1. Solubility residues
     if input("✏️ Would you like to generate solubility hotspots? (y/n): ").strip().lower() == 'y':
-        #        bcut = float(input("📈 B-factor/solubility threshold (e.g., -0.3): ").strip()
-        bcut=-0.6
+        #        bcut = float(input("📈 B-factor/solubility threshold (e.g., -0.3): ").strip())
+        bcut=-0.6 # Pre-set threshold as per original script
         flex = get_insoluble_residues(pdb_file_camsol, bcut)
         out1 = os.path.join(results_dir, "camsol_residues.csv")
         write_list_to_csv(out1, flex, ["chain", "resnum", "resname", "avg_bfactor"])
@@ -295,7 +403,7 @@ if __name__ == "__main__":
     if input("✏️ Would you like to generate aggregation hotspots? (y/n): ").strip().lower() == 'y':
         #agg_file = input("📄 Path to aggregation_residues.txt: ").strip()
         #scut = float(input("📈 Aggregation score threshold (e.g., 0.3): ").strip())
-        scut=0.6
+        scut=0.6 # Pre-set threshold as per original script
         agg = get_aggregation_residues(agg_file, scut)
         out2 = os.path.join(results_dir, "aggregation_residues.csv")
         write_list_to_csv(out2, agg, ["chain", "resnum", "resname", "score"])
@@ -310,23 +418,36 @@ if __name__ == "__main__":
         headers=["chain", "resnum", "resname", "camsol_score", "aggregascan_score", "source"]
     )
 
-    # 4. Rosetta mut files
+
+    # 4. Aggrega4Scan auto prep
+    if input("✏️ Prepare PDB for AggregaScan submission? (y/n): ").strip().lower() == "y":
+        out_folder = OUTPUT_DIR # Using the main output directory
+
+        heavy_range_str = input('Heavy chain residues (e.g. 1-121): ').strip()
+        light_range_str = input('Light chain residues (e.g. 122-226): ').strip()
+
+        l_start, l_end = map(int, light_range_str.split("-"))
+        h_start, h_end = map(int, heavy_range_str.split("-"))
+
+        Aggrega4scan_auto_prep(
+            input_pdb=output_single_chain_path,  # make sure this is your renumbered single-chain PDB
+            output_folder=out_folder,
+            light_range=(l_start, l_end),
+            heavy_range=(h_start, h_end),
+        )
+
+    #5. Rosetta mut files
+
     write_per_residue_mutfiles(
-        input_csv=out_merge,  # ← use the path you already created
+        input_csv=out_merge,
         output_root=os.path.join(results_dir, "mutfiles")
     )
 
 
     # 5. Instability hotspots
-    #    if input("✏️ Would you like to generate stability hotspots? (y/n): ").strip().lower() == 'y':
-        #cif_path = input("Path to .exposed.pdf file: ").strip()
-    #   cif_path = r"C:\Users\aszyk\PycharmProjects\Simple_helicase_mutant_selector\pdb\2P6R_exposed_surface.pdb"
-    #    chain_id = input("Chain to analyze (e.g. A): ").strip()
-    #    inst_list = get_instability_residues(cif_path, chain_id)
-    #    out5_csv = os.path.join(results_dir, "instability_residues.csv")
-    #    write_list_to_csv(out5_csv,inst_list,headers=["Chain","ResNum","ResName","Instability","Mutate to..."])
-
-
-
-
-
+    if input("✏️ Would you like to generate instability hotspots? (y/n): ").strip().lower() == 'y':
+        instability_cif_path = input("Path to PDB file for instability analysis: ").strip()
+        instability_chain_id = input("Chain to analyze for instability (e.g. A): ").strip()
+        inst_list = get_instability_residues(instability_cif_path, instability_chain_id)
+        out5_csv = os.path.join(results_dir, "instability_residues.csv")
+        write_list_to_csv(out5_csv,inst_list,headers=["Chain","ResNum","ResName","Instability","Mutate to..."])
