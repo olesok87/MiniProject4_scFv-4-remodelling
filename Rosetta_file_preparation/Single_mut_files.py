@@ -5,13 +5,15 @@ from Bio.PDB import PDBParser, NeighborSearch, Selection
 import numpy as np
 import sys
 
-PROJECT_ROOT = r"C:\Users\aszyk\PycharmProjects\Miniproject 4 scaffold engineering"
-SCRIPTS_ROOT = os.path.join(PROJECT_ROOT, "Miniproject4 scripts")
+# compute script folder dynamically so paths stay valid when moving the project
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPTS_ROOT = SCRIPT_DIR
+PROJECT_ROOT = SCRIPTS_ROOT  # script root == script directory
 
 INPUT_DIR  = os.path.join(SCRIPTS_ROOT, "Input files")
 OUTPUT_DIR = os.path.join(SCRIPTS_ROOT, "Output")
+CLEANED_PDB_DIR = os.path.join(INPUT_DIR, "cleaned_pdb")  # always under `Input files`
 
-CLEANED_PDB_DIR = os.path.join(INPUT_DIR, "cleaned_pdb")  # <-- always under Input files
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CLEANED_PDB_DIR, exist_ok=True)
@@ -251,63 +253,6 @@ def write_per_residue_mutfiles(
 
 
 
-def Aggrega4scan_auto_prep(
-    input_pdb: str,
-    output_folder: str,
-    light_range: tuple[int, int],
-    heavy_range: tuple[int, int],
-):
-    os.makedirs(output_folder, exist_ok=True)
-    output_pdb = os.path.join(output_folder, "Aggrega4auto_submission.pdb")
-
-    if not os.path.isfile(input_pdb):
-        raise FileNotFoundError(f"Input PDB not found: {input_pdb}")
-
-    (l_start, l_end) = light_range
-    (h_start, h_end) = heavy_range
-
-    if l_start > l_end or h_start > h_end:
-        raise ValueError("Ranges must be START-END with START <= END.")
-    if not (l_end < h_start or h_end < l_start):
-        raise ValueError(f"Light range {light_range} overlaps heavy range {heavy_range}.")
-
-    parser = PDB.PDBParser(QUIET=True)
-    structure = parser.get_structure("protein", input_pdb)
-
-    new_structure = PDB.Structure.Structure("split")
-    new_model = PDB.Model.Model(0)
-    new_structure.add(new_model)
-
-    chainA = PDB.Chain.Chain("A")  # heavy
-    chainB = PDB.Chain.Chain("B")  # light
-    new_model.add(chainA)
-    new_model.add(chainB)
-
-    nA = nB = 0
-
-    for model in structure:
-        for chain in model:
-            for residue in chain:
-                if residue.id[0] != " ":
-                    continue
-                resnum = int(residue.id[1])
-
-                if h_start <= resnum <= h_end:
-                    chainA.add(residue.copy()); nA += 1
-                elif l_start <= resnum <= l_end:
-                    chainB.add(residue.copy()); nB += 1
-
-    if nA == 0 and nB == 0:
-        raise RuntimeError("No residues selected. Your ranges do not match the PDB numbering.")
-
-    io = PDB.PDBIO()
-    io.set_structure(new_structure)
-    io.save(output_pdb)
-
-    print(f"✅ Saved AggregaScan submission PDB: {output_pdb}")
-    print(f"   Heavy (A) residues written: {nA}")
-    print(f"   Light (B) residues written: {nB}")
-
 
 
 def get_instability_residues(pdb_path: str, chain_id: str):
@@ -419,24 +364,7 @@ if __name__ == "__main__":
     )
 
 
-    # 4. Aggrega4Scan auto prep
-    if input("✏️ Prepare PDB for AggregaScan submission? (y/n): ").strip().lower() == "y":
-        out_folder = OUTPUT_DIR # Using the main output directory
-
-        heavy_range_str = input('Heavy chain residues (e.g. 1-121): ').strip()
-        light_range_str = input('Light chain residues (e.g. 122-226): ').strip()
-
-        l_start, l_end = map(int, light_range_str.split("-"))
-        h_start, h_end = map(int, heavy_range_str.split("-"))
-
-        Aggrega4scan_auto_prep(
-            input_pdb=output_single_chain_path,  # make sure this is your renumbered single-chain PDB
-            output_folder=out_folder,
-            light_range=(l_start, l_end),
-            heavy_range=(h_start, h_end),
-        )
-
-    #5. Rosetta mut files
+    #4. Rosetta mut files
 
     write_per_residue_mutfiles(
         input_csv=out_merge,
